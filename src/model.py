@@ -176,12 +176,12 @@ class ThreeStreamViT(nn.Module):
         z_s = self.spatial_embed(patches)
 
         B, N, C, pH, pW = patches.shape
-        freq_patches = compute_fft_magnitude(patches.view(-1, C, pH, pW))
-        freq_patches = freq_patches.view(B, N, C, pH, pW)
+        freq_patches = compute_fft_magnitude(patches.reshape(-1, C, pH, pW))
+        freq_patches = freq_patches.reshape(B, N, C, pH, pW)
         z_f = self.freq_embed(freq_patches)
 
-        noise_patches = compute_noise_residual(patches.view(-1, C, pH, pW))
-        noise_patches = noise_patches.view(B, N, C, pH, pW)
+        noise_patches = compute_noise_residual(patches.reshape(-1, C, pH, pW))
+        noise_patches = noise_patches.reshape(B, N, C, pH, pW)
         z_n = self.noise_embed(noise_patches)
 
         # --- Cross-attention fusion ---
