@@ -27,13 +27,14 @@ def parse_args():
                         help="Path to dataset root (e.g. data/raw/CASIA_v2)")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--img_size", type=int, default=224)
     parser.add_argument("--patch_size", type=int, default=16)
     parser.add_argument("--embed_dim", type=int, default=768)
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--save_dir", type=str, default="results/checkpoints")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--num_workers", type=int, default=2, help="Number of data loading workers")
     return parser.parse_args()
 
 
@@ -55,7 +56,8 @@ def train_one_epoch(model, loader, optimizer, criterion_det, criterion_cls, devi
         # Only compute classification loss on tampered samples
         tampered_mask = binary_labels == 1
         if tampered_mask.sum() > 0:
-            loss_cls = criterion_cls(cls_logits[tampered_mask], forgery_labels[tampered_mask])
+            # Subtract 1 because tampered forgery_labels are 1, 2, 3 but model outputs 3 logits (0, 1, 2)
+            loss_cls = criterion_cls(cls_logits[tampered_mask], forgery_labels[tampered_mask] - 1)
         else:
             loss_cls = torch.tensor(0.0, device=device)
 
@@ -87,6 +89,7 @@ def main():
         batch_size=args.batch_size,
         is_train=True,
         img_size=args.img_size,
+        num_workers=args.num_workers,
     )
 
     model = ThreeStreamViT(
