@@ -9,6 +9,12 @@ This module implements the three forensic feature extraction pipelines:
 References:
 - Fridrich & Kodovsky (2012) - Rich Models for Steganalysis (SRM filters)
 - Dosovitskiy et al. (2021) - ViT patch embedding
+
+Perf note: the noise-residual extractor is now a small nn.Module that
+builds its high-pass kernel ONCE (registered as a buffer) and applies it
+with a single grouped conv2d, instead of rebuilding the kernel and looping
+over channels in Python on every forward call. Same math, much less
+per-batch overhead.
 """
 
 import numpy as np
@@ -67,11 +73,47 @@ def _build_srm_highpass_kernel(ksize: int = 5) -> torch.Tensor:
     return hp_kernel.unsqueeze(0).unsqueeze(0)  # (1, 1, K, K)
 
 
-def compute_noise_residual(
-    patch: torch.Tensor, ksize: int = 5
-) -> torch.Tensor:
+class NoiseResidualExtractor(nn.Module):
     """
-    Extract the noise residual of an image patch using a Gaussian HP filter.
+    Fast noise-residual extractor.
+
+    Builds the high-pass kernel once at construction time and applies it
+    to all channels in a single grouped conv2d call (groups=channels),
+    instead of rebuilding the kernel and looping over channels in Python
+    on every forward pass. Registered as a buffer so it moves with
+    `.to(device)` and is excluded from gradient updates automatically.
+    """
+
+    def __init__(self, ksize: int = 5, channels: int = 3):
+        super().__init__()
+        kernel = _build_srm_highpass_kernel(ksize)          # (1, 1, K, K)
+        kernel = kernel.repeat(channels, 1, 1, 1)            # (C, 1, K, K)
+        self.register_buffer("kernel", kernel)
+        self.ksize = ksize
+        self.channels = channels
+
+    def forward(self, patch: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            patch: Tensor of shape (B, C, H, W).
+
+        Returns:
+            Noise residual of shape (B, C, H, W).
+        """
+        return F.conv2d(
+            patch,
+            self.kernel,
+            padding=self.ksize // 2,
+            groups=self.channels,
+        )
+
+
+def compute_noise_residual(patch: torch.Tensor, ksize: int = 5) -> torch.Tensor:
+    """
+    Kept for backward compatibility / one-off use outside the model
+    (e.g. notebooks, quick experiments). For anything running inside a
+    training or eval loop, use `NoiseResidualExtractor` instead — this
+    functional version still rebuilds the kernel on every call.
 
     Args:
         patch: Tensor of shape (B, C, H, W).
@@ -81,16 +123,8 @@ def compute_noise_residual(
         Noise residual of shape (B, C, H, W).
     """
     kernel = _build_srm_highpass_kernel(ksize).to(patch.device)
-    # Apply per-channel
-    channels = []
-    for c in range(patch.shape[1]):
-        filtered = F.conv2d(
-            patch[:, c : c + 1, :, :],
-            kernel,
-            padding=ksize // 2,
-        )
-        channels.append(filtered)
-    return torch.cat(channels, dim=1)
+    kernel = kernel.repeat(patch.shape[1], 1, 1, 1)
+    return F.conv2d(patch, kernel, padding=ksize // 2, groups=patch.shape[1])
 
 
 # ---------------------------------------------------------------------------

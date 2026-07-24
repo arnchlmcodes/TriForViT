@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import math
 
-from extractors import compute_fft_magnitude, compute_noise_residual
+from extractors import compute_fft_magnitude, NoiseResidualExtractor, extract_patches
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +144,9 @@ class ThreeStreamViT(nn.Module):
         self.freq_embed = PatchEmbedding(patch_size, in_channels, embed_dim)
         self.noise_embed = PatchEmbedding(patch_size, in_channels, embed_dim)
 
+        # --- Noise-residual extractor (kernel built once, reused every call) ---
+        self.noise_extractor = NoiseResidualExtractor(ksize=5, channels=in_channels)
+
         # --- Fusion ---
         self.fusion = CrossAttentionFusion(embed_dim, num_heads=8)
 
@@ -168,19 +171,17 @@ class ThreeStreamViT(nn.Module):
             detection_logits: (B, 2)
             classification_logits: (B, num_forgery_types)
         """
-        from extractors import extract_patches
-
         patches = extract_patches(images, self.patch_size)  # (B, N, C, pH, pW)
+        B, N, C, pH, pW = patches.shape
 
         # --- Three streams ---
         z_s = self.spatial_embed(patches)
 
-        B, N, C, pH, pW = patches.shape
         freq_patches = compute_fft_magnitude(patches.reshape(-1, C, pH, pW))
         freq_patches = freq_patches.reshape(B, N, C, pH, pW)
         z_f = self.freq_embed(freq_patches)
 
-        noise_patches = compute_noise_residual(patches.reshape(-1, C, pH, pW))
+        noise_patches = self.noise_extractor(patches.reshape(-1, C, pH, pW))
         noise_patches = noise_patches.reshape(B, N, C, pH, pW)
         z_n = self.noise_embed(noise_patches)
 

@@ -57,7 +57,14 @@ def evaluate(model, loader, device):
         tampered_mask = binary_labels == 1
         if tampered_mask.sum() > 0:
             all_cls_preds.extend(cls_preds[tampered_mask].numpy())
-            all_cls_labels.extend(forgery_labels[tampered_mask].numpy())
+            # forgery_labels are 1/2/3 (copy_move/splicing/inpainting) from
+            # FORGERY_TYPES in data_loader.py, but the classification head
+            # only has 3 output logits (0/1/2) — shift by -1 to match, same
+            # as train.py already does for loss_cls. Without this shift,
+            # every correct prediction registers as wrong, and
+            # classification_report/confusion_matrix will crash once all
+            # three types appear (4 distinct label values vs 3 target_names).
+            all_cls_labels.extend((forgery_labels[tampered_mask] - 1).numpy())
 
     return (
         np.array(all_det_preds), np.array(all_det_labels),
@@ -108,7 +115,7 @@ def compute_gradcam(model, image, target_class=None, device="cpu"):
         pred_class: Predicted class index.
     """
     model.eval()
-    
+
     # Store activations and gradients
     activations = []
     gradients = []
@@ -123,7 +130,7 @@ def compute_gradcam(model, image, target_class=None, device="cpu"):
 
     # Get the last layer of the transformer encoder
     target_layer = model.transformer.encoder.layers[-1]
-    
+
     # Register hooks
     handle_forward = target_layer.register_forward_hook(forward_hook)
     handle_backward = target_layer.register_full_backward_hook(backward_hook)
@@ -138,7 +145,7 @@ def compute_gradcam(model, image, target_class=None, device="cpu"):
 
     # Target class score
     score = det_logits[0, target_class]
-    
+
     # Zero gradients and backprop
     model.zero_grad()
     score.backward()
@@ -160,7 +167,7 @@ def compute_gradcam(model, image, target_class=None, device="cpu"):
 
     # Compute channel weights: mean of gradients over tokens (N)
     weights = grad.mean(dim=1)  # (1, D)
-    
+
     # Weighted sum of activations
     cam = (weights.unsqueeze(1) * act).sum(dim=-1)  # (1, N)
     cam = F.relu(cam)  # Apply ReLU
@@ -193,7 +200,7 @@ def save_gradcam_visualization(original_img_path, heatmap, pred_class, output_pa
     orig_np = np.array(orig_img) / 255.0
 
     plt.figure(figsize=(10, 5))
-    
+
     # Original
     plt.subplot(1, 2, 1)
     plt.imshow(orig_np)
@@ -243,18 +250,18 @@ def main():
         tampered_count = 0
         for i in range(len(dataset)):
             img_path, binary_label, forgery_label = dataset.samples[i]
-            if binary_label == 1: # Tampered
+            if binary_label == 1:  # Tampered
                 # Get raw tensor image
                 image, _, _ = dataset[i]
-                image = image.unsqueeze(0).to(args.device) # Add batch dimension
-                
+                image = image.unsqueeze(0).to(args.device)  # Add batch dimension
+
                 heatmap, pred_class = compute_gradcam(model, image, target_class=1, device=args.device)
-                
+
                 output_filename = f"gradcam_tampered_{tampered_count}.png"
                 output_path = os.path.join("results", "figures", output_filename)
-                
+
                 save_gradcam_visualization(img_path, heatmap, pred_class, output_path)
-                
+
                 tampered_count += 1
                 if tampered_count >= 3:
                     break

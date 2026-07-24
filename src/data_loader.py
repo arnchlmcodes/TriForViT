@@ -177,4 +177,8 @@ def create_dataloader(
         shuffle=is_train,
         num_workers=num_workers,
         pin_memory=True,
+        # Keeps worker processes alive between epochs instead of tearing
+        # them down and re-spawning each time — meaningful savings when
+        # there are many short epochs. No-op / ignored when num_workers=0.
+        persistent_workers=(num_workers > 0),
     )

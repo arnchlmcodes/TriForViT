@@ -34,11 +34,15 @@ def parse_args():
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--save_dir", type=str, default="results/checkpoints")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--num_workers", type=int, default=2, help="Number of data loading workers")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    parser.add_argument("--amp", action="store_true", default=True,
+                        help="Use automatic mixed precision (default: on when CUDA is available)")
+    parser.add_argument("--no_amp", dest="amp", action="store_false",
+                        help="Disable automatic mixed precision")
     return parser.parse_args()
 
 
-def train_one_epoch(model, loader, optimizer, criterion_det, criterion_cls, device):
+def train_one_epoch(model, loader, optimizer, criterion_det, criterion_cls, device, scaler, use_amp):
     """Train for one epoch with joint detection + classification loss."""
     model.train()
     total_loss = 0.0
@@ -46,26 +50,33 @@ def train_one_epoch(model, loader, optimizer, criterion_det, criterion_cls, devi
     total = 0
 
     for images, binary_labels, forgery_labels in loader:
-        images = images.to(device)
-        binary_labels = binary_labels.to(device)
-        forgery_labels = forgery_labels.to(device)
+        images = images.to(device, non_blocking=True)
+        binary_labels = binary_labels.to(device, non_blocking=True)
+        forgery_labels = forgery_labels.to(device, non_blocking=True)
 
-        det_logits, cls_logits = model(images)
+        optimizer.zero_grad(set_to_none=True)
 
-        loss_det = criterion_det(det_logits, binary_labels)
-        # Only compute classification loss on tampered samples
-        tampered_mask = binary_labels == 1
-        if tampered_mask.sum() > 0:
-            # Subtract 1 because tampered forgery_labels are 1, 2, 3 but model outputs 3 logits (0, 1, 2)
-            loss_cls = criterion_cls(cls_logits[tampered_mask], forgery_labels[tampered_mask] - 1)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            det_logits, cls_logits = model(images)
+
+            loss_det = criterion_det(det_logits, binary_labels)
+            # Only compute classification loss on tampered samples
+            tampered_mask = binary_labels == 1
+            if tampered_mask.sum() > 0:
+                # Subtract 1 because tampered forgery_labels are 1, 2, 3 but model outputs 3 logits (0, 1, 2)
+                loss_cls = criterion_cls(cls_logits[tampered_mask], forgery_labels[tampered_mask] - 1)
+            else:
+                loss_cls = torch.tensor(0.0, device=device)
+
+            loss = loss_det + 0.5 * loss_cls  # weighted sum
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            loss_cls = torch.tensor(0.0, device=device)
-
-        loss = loss_det + 0.5 * loss_cls  # weighted sum
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item() * images.size(0)
         preds = det_logits.argmax(dim=1)
@@ -81,7 +92,10 @@ def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
 
-    print(f"[INFO] Device: {args.device}")
+    use_amp = args.amp and args.device.startswith("cuda")
+
+    print(f"[INFO] Device: {args.device}  (CUDA available: {torch.cuda.is_available()})")
+    print(f"[INFO] Mixed precision (AMP): {'on' if use_amp else 'off'}")
     print(f"[INFO] Loading data from: {args.data_dir}")
 
     loader = create_dataloader(
@@ -103,12 +117,14 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion_det = nn.CrossEntropyLoss()
     criterion_cls = nn.CrossEntropyLoss()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     print(f"[INFO] Starting training for {args.epochs} epochs...")
 
     for epoch in range(1, args.epochs + 1):
         loss, acc = train_one_epoch(
-            model, loader, optimizer, criterion_det, criterion_cls, args.device
+            model, loader, optimizer, criterion_det, criterion_cls,
+            args.device, scaler, use_amp,
         )
         scheduler.step()
 
