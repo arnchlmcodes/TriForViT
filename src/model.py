@@ -83,32 +83,35 @@ class CrossAttentionFusion(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Transformer Encoder (lightweight placeholder — swap with timm/ViT later)
+# Transformer Encoder (Pre-trained ViT via timm)
 # ---------------------------------------------------------------------------
 
-class TransformerEncoder(nn.Module):
-    """Standard Transformer encoder block stack."""
+class TimmTransformerEncoder(nn.Module):
+    """Pre-trained Vision Transformer from timm."""
 
-    def __init__(
-        self,
-        embed_dim: int = 768,
-        depth: int = 12,
-        num_heads: int = 12,
-        mlp_ratio: float = 4.0,
-    ):
+    def __init__(self, model_name: str = "vit_base_patch16_224"):
         super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=int(embed_dim * mlp_ratio),
-            batch_first=True,
-            activation="gelu",
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.norm = nn.LayerNorm(embed_dim)
+        try:
+            import timm
+        except ImportError:
+            raise ImportError("Please run 'pip install timm' to use the pre-trained model.")
+        
+        # Load the pre-trained model
+        self.vit = timm.create_model(model_name, pretrained=True)
+        
+        # Extract the pre-trained cls_token and pos_embed
+        self.cls_token = self.vit.cls_token
+        self.pos_embed = self.vit.pos_embed
+        
+        # Extract the blocks and normalization layer
+        self.blocks = self.vit.blocks
+        self.norm = self.vit.norm
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.encoder(x))
+        # x is expected to be shape (B, N+1, D)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -150,14 +153,8 @@ class ThreeStreamViT(nn.Module):
         # --- Fusion ---
         self.fusion = CrossAttentionFusion(embed_dim, num_heads=8)
 
-        # --- Positional embedding + CLS token ---
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-
-        # --- Transformer ---
-        self.transformer = TransformerEncoder(embed_dim, depth, num_heads)
+        # --- Transformer (Pre-trained) ---
+        self.transformer = TimmTransformerEncoder(model_name="vit_base_patch16_224")
 
         # --- Classification heads ---
         self.detection_head = nn.Linear(embed_dim, 2)        # authentic / tampered
@@ -188,10 +185,10 @@ class ThreeStreamViT(nn.Module):
         # --- Cross-attention fusion ---
         fused = self.fusion(z_s, z_f, z_n)  # (B, N, D)
 
-        # Prepend CLS token + add positional embeddings
-        cls = self.cls_token.expand(B, -1, -1)
+        # Prepend CLS token + add positional embeddings from the pre-trained timm model
+        cls = self.transformer.cls_token.expand(B, -1, -1)
         tokens = torch.cat([cls, fused], dim=1)
-        tokens = tokens + self.pos_embed
+        tokens = tokens + self.transformer.pos_embed
 
         # --- Transformer ---
         encoded = self.transformer(tokens)
