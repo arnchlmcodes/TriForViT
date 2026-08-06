@@ -255,3 +255,140 @@ def create_split_dataloaders(
     )
 
     return train_loader, val_loader, test_loader
+
+# ---------------------------------------------------------------------------
+# DEFACTO Copy-Move Dataset
+# ---------------------------------------------------------------------------
+
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
+
+
+class DefactoCopyMoveDataset(Dataset):
+    """
+    Dataset for the DEFACTO copy-move Kaggle mount:
+
+        defacto-copymove/
+            copymove_img/           <- forged images (recursively globbed)
+            copymove_annotations/   <- probe_mask / donor_mask / graph (ignored here)
+
+    DEFACTO-copymove ships forged images only, so `authentic_dir` is
+    optional but strongly recommended — without it every sample has
+    binary_label=1 and the Stage-1 auth/tampered head can't learn
+    anything meaningful.
+
+    Args:
+        copymove_img_dir: path to the `copymove_img` folder (or its parent
+            `defacto-copymove` folder — both are handled).
+        authentic_dir: optional path to a folder of pristine/authentic
+            images (searched recursively). If omitted, all samples are
+            tampered/copy_move.
+    """
+
+    def __init__(
+        self,
+        copymove_img_dir: str,
+        authentic_dir: Optional[str] = None,
+        transform: Optional[transforms.Compose] = None,
+    ):
+        super().__init__()
+        self.transform = transform
+        self.samples = []  # (image_path, binary_label, forgery_label)
+
+        cm_root = Path(copymove_img_dir)
+        # Allow passing either .../defacto-copymove or .../defacto-copymove/copymove_img
+        if (cm_root / "copymove_img").is_dir():
+            cm_root = cm_root / "copymove_img"
+        if not cm_root.is_dir():
+            raise FileNotFoundError(f"copymove_img directory not found at: {cm_root}")
+
+        cm_count = 0
+        for img_path in cm_root.rglob("*"):
+            if img_path.suffix.lower() in IMG_EXTS:
+                self.samples.append((
+                    str(img_path),
+                    BINARY_LABELS["tampered"],
+                    FORGERY_TYPES["copy_move"],
+                ))
+                cm_count += 1
+        if cm_count == 0:
+            raise RuntimeError(f"No images found under {cm_root} — check the mount path.")
+
+        auth_count = 0
+        if authentic_dir is not None:
+            auth_root = Path(authentic_dir)
+            for img_path in auth_root.rglob("*"):
+                if img_path.suffix.lower() in IMG_EXTS:
+                    self.samples.append((
+                        str(img_path),
+                        BINARY_LABELS["authentic"],
+                        FORGERY_TYPES["authentic"],
+                    ))
+                    auth_count += 1
+            if auth_count == 0:
+                print(f"[WARN] authentic_dir given ({auth_root}) but no images found in it.")
+
+        if auth_count == 0:
+            print(
+                "[WARN] No authentic images loaded — every sample is tampered "
+                "(binary_label=1). The Stage-1 binary head has nothing to "
+                "discriminate against and will not learn. Pass authentic_dir "
+                "to fix this."
+            )
+        print(f"[INFO] DefactoCopyMoveDataset: {cm_count} copy-move, {auth_count} authentic "
+              f"({len(self.samples)} total).")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, binary_label, forgery_label = self.samples[idx]
+        image = Image.open(img_path).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        return image, binary_label, forgery_label
+
+
+def create_defacto_split_dataloaders(
+    copymove_img_dir: str,
+    authentic_dir: Optional[str] = None,
+    batch_size: int = 32,
+    img_size: int = 224,
+    num_workers: int = 4,
+    split_ratio: Tuple[float, float, float] = (0.8, 0.1, 0.1),
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Same train/val/test split behavior as create_split_dataloaders, but
+    backed by DefactoCopyMoveDataset instead of the folder-per-class
+    ForgeryDataset.
+    """
+    full_dataset = DefactoCopyMoveDataset(copymove_img_dir, authentic_dir, transform=None)
+
+    total_size = len(full_dataset)
+    train_size = int(split_ratio[0] * total_size)
+    val_size = int(split_ratio[1] * total_size)
+    test_size = total_size - train_size - val_size
+
+    generator = torch.Generator().manual_seed(42)
+    train_subset, val_subset, test_subset = random_split(
+        full_dataset, [train_size, val_size, test_size], generator=generator
+    )
+
+    train_dataset = TransformSubset(train_subset, transform=get_train_transforms(img_size))
+    val_dataset = TransformSubset(val_subset, transform=get_eval_transforms(img_size))
+    test_dataset = TransformSubset(test_subset, transform=get_eval_transforms(img_size))
+
+    persistent = (num_workers > 0)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True, persistent_workers=persistent
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True, persistent_workers=persistent
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True, persistent_workers=persistent
+    )
+
+    return train_loader, val_loader, test_loader

@@ -18,13 +18,23 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from model import ThreeStreamViT
-from data_loader import create_split_dataloaders
+from data_loader import create_split_dataloaders, create_defacto_split_dataloaders
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Three-Stream ViT")
     parser.add_argument("--data_dir", type=str, required=True,
-                        help="Path to dataset root (e.g. data/raw/CASIA_v2)")
+                        help="Path to dataset root (e.g. data/raw/CASIA_v2, or the "
+                             "defacto-copymove folder / its copymove_img subfolder "
+                             "when --defacto is set)")
+    parser.add_argument("--defacto", action="store_true",
+                        help="Use the DEFACTO copy-move loader instead of the generic "
+                             "folder-per-class loader (data_dir should point at "
+                             "defacto-copymove or defacto-copymove/copymove_img)")
+    parser.add_argument("--authentic_dir", type=str, default=None,
+                        help="Only used with --defacto: path to a folder of authentic/"
+                             "pristine images. DEFACTO-copymove ships forged images "
+                             "only, so omit this and the binary head trains degenerate.")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -35,6 +45,11 @@ def parse_args():
     parser.add_argument("--save_dir", type=str, default="results/checkpoints")
     parser.add_argument("--device", type=str, default="mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    parser.add_argument("--multi_gpu", action="store_true", default=True,
+                        help="Use nn.DataParallel across all visible CUDA GPUs when more "
+                             "than one is available (default: on, e.g. Kaggle's 2x T4)")
+    parser.add_argument("--no_multi_gpu", dest="multi_gpu", action="store_false",
+                        help="Disable multi-GPU even if multiple CUDA devices are visible")
     parser.add_argument("--amp", action="store_true", default=True,
                         help="Use automatic mixed precision (default: on when CUDA is available)")
     parser.add_argument("--no_amp", dest="amp", action="store_false",
@@ -134,12 +149,21 @@ def main():
     print(f"[INFO] Mixed precision (AMP): {'on' if use_amp else 'off'}")
     print(f"[INFO] Loading data from: {args.data_dir}")
 
-    train_loader, val_loader, test_loader = create_split_dataloaders(
-        args.data_dir,
-        batch_size=args.batch_size,
-        img_size=args.img_size,
-        num_workers=args.num_workers,
-    )
+    if args.defacto:
+        train_loader, val_loader, test_loader = create_defacto_split_dataloaders(
+            args.data_dir,
+            authentic_dir=args.authentic_dir,
+            batch_size=args.batch_size,
+            img_size=args.img_size,
+            num_workers=args.num_workers,
+        )
+    else:
+        train_loader, val_loader, test_loader = create_split_dataloaders(
+            args.data_dir,
+            batch_size=args.batch_size,
+            img_size=args.img_size,
+            num_workers=args.num_workers,
+        )
 
     model = ThreeStreamViT(
         img_size=args.img_size,
@@ -147,6 +171,15 @@ def main():
         embed_dim=args.embed_dim,
         depth=args.depth,
     ).to(args.device)
+
+    num_gpus = torch.cuda.device_count()
+    use_data_parallel = args.multi_gpu and args.device.startswith("cuda") and num_gpus > 1
+    if use_data_parallel:
+        print(f"[INFO] Using nn.DataParallel across {num_gpus} GPUs "
+              f"(effective batch_size {args.batch_size} split across devices)")
+        model = nn.DataParallel(model)
+    elif args.multi_gpu and args.device.startswith("cuda") and num_gpus <= 1:
+        print("[INFO] --multi_gpu requested but only 1 CUDA device visible; running single-GPU.")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -173,9 +206,10 @@ def main():
         # Save checkpoint every 10 epochs
         if epoch % 10 == 0:
             ckpt_path = os.path.join(args.save_dir, f"checkpoint_epoch{epoch}.pth")
+            state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
             torch.save({
                 "epoch": epoch,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": state_dict,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": train_loss,
             }, ckpt_path)
@@ -183,7 +217,8 @@ def main():
 
     # Save final model
     final_path = os.path.join(args.save_dir, "model_final.pth")
-    torch.save(model.state_dict(), final_path)
+    final_state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    torch.save(final_state_dict, final_path)
     print(f"[INFO] Training complete. Final model saved to {final_path}")
 
 
