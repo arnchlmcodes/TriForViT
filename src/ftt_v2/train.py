@@ -60,11 +60,12 @@ def build_dataloaders(cfg: dict, backbone_info: dict) -> tuple:
     train_manifest = os.path.join(manifest_dir, "train.csv")
     val_manifest = os.path.join(manifest_dir, "val.csv")
 
-    train_ds = ForensicDataset(train_manifest, transform=train_transform)
-    val_ds = ForensicDataset(val_manifest, transform=val_transform)
+    image_root = data_cfg.get("image_root", None)
+    train_ds = ForensicDataset(train_manifest, image_root=image_root, transform=train_transform)
+    val_ds = ForensicDataset(val_manifest, image_root=image_root, transform=val_transform)
 
     train_cfg = cfg.get("train", {})
-    micro_batch = train_cfg.get("micro_batch", 8)
+    micro_batch = train_cfg.get("_effective_micro") or train_cfg.get("micro_batch", 8)
     num_workers = data_cfg.get("num_workers", 4)
 
     # Balanced sampler
@@ -149,7 +150,7 @@ def build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
 
 @torch.no_grad()
 def validate(
-    model: ForensicModel,
+    model,
     val_loader: DataLoader,
     loss_fn: FTTv2Loss,
     device: torch.device,
@@ -161,6 +162,8 @@ def validate(
     masks, keeping peak RAM bounded regardless of validation set size.
     """
     model.eval()
+    # Unwrap DataParallel for attribute access
+    raw_model: ForensicModel = model.module if isinstance(model, nn.DataParallel) else model
     det_scores, det_labels = [], []
     type_scores_list, type_targets_list, type_valid_list = [], [], []
     # Pixel-level: accumulate TP/FP/FN per image (forged only)
@@ -185,8 +188,8 @@ def validate(
             output.mask_logits, mask_gt,
             output.det_logit, is_forged,
             output.type_logits, type_targets, type_valid,
-            det_enabled=model.det_enabled,
-            type_enabled=model.type_enabled,
+            det_enabled=raw_model.det_enabled,
+            type_enabled=raw_model.type_enabled,
         )
         total_loss += losses["total"].item() * loss_fn.accum_steps
         n_batches += 1
@@ -260,7 +263,7 @@ def validate(
 
 
 def train_one_epoch(
-    model: ForensicModel,
+    model,
     train_loader: DataLoader,
     loss_fn: FTTv2Loss,
     optimizer: torch.optim.Optimizer,
@@ -272,8 +275,11 @@ def train_one_epoch(
 ) -> Dict[str, float]:
     """Train for one epoch with gradient accumulation and AMP."""
     model.train()
+    # Unwrap DataParallel for attribute access and param inspection
+    raw_model: ForensicModel = model.module if isinstance(model, nn.DataParallel) else model
+
     train_cfg = cfg.get("train", {})
-    micro_batch = train_cfg.get("micro_batch", 8)
+    micro_batch = train_cfg.get("_effective_micro") or train_cfg.get("micro_batch", 8)
     effective_batch = train_cfg.get("effective_batch", 64)
     accum_steps = max(effective_batch // micro_batch, 1)
     grad_clip = train_cfg.get("grad_clip", 1.0)
@@ -284,7 +290,7 @@ def train_one_epoch(
     n_skipped = 0
 
     # Assertion: no non-LoRA backbone param has requires_grad=True
-    for name, p in model.backbone.named_parameters():
+    for name, p in raw_model.backbone.named_parameters():
         if p.requires_grad and "lora_" not in name:
             raise RuntimeError(
                 f"Non-LoRA backbone param {name} has requires_grad=True! "
@@ -307,8 +313,8 @@ def train_one_epoch(
                 output.mask_logits, mask_gt,
                 output.det_logit, is_forged,
                 output.type_logits, type_targets, type_valid,
-                det_enabled=model.det_enabled,
-                type_enabled=model.type_enabled,
+                det_enabled=raw_model.det_enabled,
+                type_enabled=raw_model.type_enabled,
             )
 
         loss = losses["total"]
@@ -378,20 +384,36 @@ def main():
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[DEVICE] {device}")
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    print(f"[DEVICE] {device}  |  GPUs detected: {n_gpus}")
 
     # Build model
     model = ForensicModel(cfg)
     model.to(device)
     model.param_report()
 
-    # Data
+    # Wrap in DataParallel when multiple GPUs are available.
+    # ALL checkpoint / optimizer / metric code uses the unwrapped `model`.
+    # Forward passes go through `model_dp`.
+    if n_gpus > 1:
+        model_dp = nn.DataParallel(model)
+        print(f"[DataParallel] using GPUs: {list(range(n_gpus))}")
+    else:
+        model_dp = model
+
+    # Scale micro-batch with GPU count so each GPU gets the configured size
+    base_micro = train_cfg.get("micro_batch", 4)
+    effective_micro = base_micro * max(n_gpus, 1)
+    cfg.setdefault("train", {})["_effective_micro"] = effective_micro
+
+    # Data (uses effective_micro for dataloader batch_size)
+    data_cfg = cfg.get("data", {})
     train_loader, val_loader = build_dataloaders(cfg, model.backbone_info)
 
-    # Optimizer & scheduler
+    # Optimizer & scheduler (always on unwrapped model)
     optimizer = build_optimizer(model, cfg)
     accum_steps = max(
-        train_cfg.get("effective_batch", 64) // train_cfg.get("micro_batch", 8), 1
+        train_cfg.get("effective_batch", 64) // effective_micro, 1
     )
     scheduler = build_scheduler(optimizer, cfg, len(train_loader) // accum_steps)
 
@@ -441,8 +463,11 @@ def main():
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
 
+        # Pass the (possibly DataParallel-wrapped) model for forward,
+        # but train_one_epoch still calls .trainable_parameters() via
+        # model_dp.module if wrapped — handled by passing unwrapped model.
         train_metrics = train_one_epoch(
-            model, train_loader, loss_fn, optimizer, scheduler,
+            model_dp, train_loader, loss_fn, optimizer, scheduler,
             scaler, device, cfg, epoch,
         )
         elapsed = time.time() - t0
@@ -463,7 +488,7 @@ def main():
 
         # Periodic evaluation
         if (epoch + 1) % eval_every == 0 or (epoch + 1) == epochs:
-            val_metrics = validate(model, val_loader, loss_fn, device, cfg)
+            val_metrics = validate(model_dp, val_loader, loss_fn, device, cfg)
 
             print(f"  [VAL] ", end="")
             for k, v in sorted(val_metrics.items()):
