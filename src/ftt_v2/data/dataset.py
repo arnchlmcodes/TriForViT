@@ -164,3 +164,8 @@ class BalancedForgeryTypeSampler(Sampler):
 
         self.rng.shuffle(all_indices)
         return iter(all_indices)
+
+
+# Aliases for backward compatibility
+ManifestDataset = ForensicDataset
+BalancedBatchSampler = BalancedForgeryTypeSampler

@@ -58,6 +58,7 @@ def load_checkpoint(
     scheduler=None,
     scaler: Optional[torch.amp.GradScaler] = None,
     device: str = "cpu",
+    restore_rng: bool = True,
 ) -> dict:
     """Load checkpoint and restore all states.
 
@@ -68,7 +69,19 @@ def load_checkpoint(
     """
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
-    model.load_state_dict(ckpt["model_state_dict"])
+    result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+
+    tags = (
+        "lora_", "mask_decoder", "det_head", "type_head",
+        "cm_branch", "patch_norm",
+    )
+    bad_missing = [k for k in result.missing_keys if any(t in k for t in tags)]
+    if result.unexpected_keys or bad_missing:
+        raise RuntimeError(
+            f"Checkpoint mismatch in load_checkpoint. "
+            f"unexpected={result.unexpected_keys[:5]} "
+            f"missing_trainable={bad_missing[:5]}"
+        )
 
     if optimizer and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -80,15 +93,23 @@ def load_checkpoint(
         scaler.load_state_dict(ckpt["scaler_state_dict"])
 
     # Restore RNG states
-    rng = ckpt.get("rng_state", {})
-    if "python" in rng:
-        random.setstate(rng["python"])
-    if "numpy" in rng:
-        np.random.set_state(rng["numpy"])
-    if "torch" in rng:
-        torch.random.set_rng_state(rng["torch"])
-    if torch.cuda.is_available() and rng.get("cuda"):
-        torch.cuda.set_rng_state_all(rng["cuda"])
+    if restore_rng:
+        rng = ckpt.get("rng_state", {})
+        if "python" in rng:
+            random.setstate(rng["python"])
+        if "numpy" in rng:
+            np.random.set_state(rng["numpy"])
+        if "torch" in rng and rng["torch"] is not None:
+            torch_state = rng["torch"]
+            if isinstance(torch_state, torch.Tensor):
+                torch_state = torch_state.cpu()
+            torch.random.set_rng_state(torch_state)
+        if torch.cuda.is_available() and rng.get("cuda"):
+            cuda_states = [
+                s.cpu() if isinstance(s, torch.Tensor) else s
+                for s in rng["cuda"]
+            ]
+            torch.cuda.set_rng_state_all(cuda_states)
 
     return {
         "epoch": ckpt["epoch"],

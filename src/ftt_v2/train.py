@@ -95,11 +95,38 @@ def build_dataloaders(cfg: dict, backbone_info: dict) -> tuple:
 
 
 def build_optimizer(model: ForensicModel, cfg: dict):
+    """Build AdamW with separate param groups: weight-decay vs no-weight-decay.
+
+    Norms, biases, and the copy-move log_tau are excluded from weight decay.
+    """
     train_cfg = cfg.get("train", {})
     lr = train_cfg.get("lr", 3e-4)
     wd = train_cfg.get("weight_decay", 0.01)
-    params = model.trainable_parameters()
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+
+    decay_params = []
+    no_decay_params = []
+    no_decay_names = set()
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # Exclude norms (LayerNorm, GroupNorm, BatchNorm weight/bias),
+        # biases, and the copy-move log temperature from weight decay.
+        if (
+            name.endswith(".bias")
+            or "norm" in name.lower()
+            or "log_tau" in name
+        ):
+            no_decay_params.append(param)
+            no_decay_names.add(name)
+        else:
+            decay_params.append(param)
+
+    param_groups = [
+        {"params": decay_params, "weight_decay": wd},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(param_groups, lr=lr)
     return optimizer
 
 
@@ -114,6 +141,7 @@ def build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        progress = min(progress, 1.0)  # Clamp: partial accum windows can overshoot
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -127,14 +155,22 @@ def validate(
     device: torch.device,
     cfg: dict,
 ) -> Dict[str, float]:
-    """Run validation and compute all metrics."""
+    """Run validation and compute all metrics.
+
+    Accumulates TP/FP/FN counts per batch instead of storing full-resolution
+    masks, keeping peak RAM bounded regardless of validation set size.
+    """
     model.eval()
     det_scores, det_labels = [], []
     type_scores_list, type_targets_list, type_valid_list = [], [], []
-    pred_masks_forged, gt_masks_forged = [], []
-    pred_masks_auth = []
+    # Pixel-level: accumulate TP/FP/FN per image (forged only)
+    pixel_f1_list = []
+    pixel_iou_list = []
+    # False alarm: per-image fraction of pixels predicted forged (authentic only)
+    false_alarm_fracs = []
     total_loss = 0.0
     n_batches = 0
+    mask_threshold = 0.5
 
     for batch in val_loader:
         images = batch["image"].to(device)
@@ -149,13 +185,13 @@ def validate(
             output.mask_logits, mask_gt,
             output.det_logit, is_forged,
             output.type_logits, type_targets, type_valid,
-            det_enabled=cfg.get("det", {}).get("enabled", False),
-            type_enabled=cfg.get("type_head", {}).get("enabled", False),
+            det_enabled=model.det_enabled,
+            type_enabled=model.type_enabled,
         )
-        total_loss += losses["total"].item()
+        total_loss += losses["total"].item() * loss_fn.accum_steps
         n_batches += 1
 
-        # Collect predictions
+        # Collect image-level predictions
         det_prob = torch.sigmoid(output.det_logit).cpu().numpy()
         det_scores.append(det_prob)
         det_labels.append(is_forged.cpu().numpy())
@@ -165,14 +201,26 @@ def validate(
         type_targets_list.append(type_targets.cpu().numpy())
         type_valid_list.append(type_valid.cpu().numpy())
 
-        mask_prob = torch.sigmoid(output.mask_logits).squeeze(1).cpu().numpy()
+        # Pixel-level: compute TP/FP/FN per image and discard masks
+        mask_pred_bin = (torch.sigmoid(output.mask_logits) >= mask_threshold).float()
         is_f = is_forged.cpu().numpy()
         for i in range(len(is_f)):
             if is_f[i] > 0.5:
-                pred_masks_forged.append(mask_prob[i])
-                gt_masks_forged.append(mask_gt[i].squeeze(0).cpu().numpy())
+                pred_i = mask_pred_bin[i].flatten()
+                gt_i = mask_gt[i].flatten()
+                tp = (pred_i * gt_i).sum().item()
+                fp = (pred_i * (1.0 - gt_i)).sum().item()
+                fn = ((1.0 - pred_i) * gt_i).sum().item()
+                prec = tp / max(tp + fp, 1e-8)
+                rec = tp / max(tp + fn, 1e-8)
+                f1 = 2 * prec * rec / max(prec + rec, 1e-8)
+                iou = tp / max(tp + fp + fn, 1e-8)
+                pixel_f1_list.append(f1)
+                pixel_iou_list.append(iou)
             else:
-                pred_masks_auth.append(mask_prob[i])
+                # Authentic: track false-alarm pixel fraction
+                frac = mask_pred_bin[i].mean().item()
+                false_alarm_fracs.append(frac)
 
     # Aggregate
     det_scores = np.concatenate(det_scores) if det_scores else np.array([])
@@ -180,9 +228,6 @@ def validate(
     type_scores_all = np.concatenate(type_scores_list) if type_scores_list else np.zeros((0, 3))
     type_targets_all = np.concatenate(type_targets_list) if type_targets_list else np.zeros((0, 3))
     type_valid_all = np.concatenate(type_valid_list) if type_valid_list else np.zeros((0, 3))
-    pred_masks_forged = np.array(pred_masks_forged) if pred_masks_forged else np.zeros((0, 512, 512))
-    gt_masks_forged = np.array(gt_masks_forged) if gt_masks_forged else np.zeros((0, 512, 512))
-    pred_masks_auth = np.array(pred_masks_auth) if pred_masks_auth else np.zeros((0, 512, 512))
 
     results = {"val_loss": total_loss / max(n_batches, 1)}
 
@@ -191,22 +236,18 @@ def validate(
         img_m = compute_image_metrics(det_scores, det_labels)
         results.update({f"img_{k}": v for k, v in img_m.items()})
 
-    # Pixel-level (forged only)
-    if len(pred_masks_forged) > 0:
-        pix_m = compute_pixel_metrics(pred_masks_forged, gt_masks_forged)
-        results.update(pix_m)
-    else:
-        results["pixel_f1"] = 0.0
+    # Pixel-level (forged only, already per-image)
+    results["pixel_f1"] = float(np.mean(pixel_f1_list)) if pixel_f1_list else 0.0
+    results["pixel_iou"] = float(np.mean(pixel_iou_list)) if pixel_iou_list else 0.0
+
+    # False alarm area on authentic
+    if false_alarm_fracs:
+        results["false_alarm_area"] = float(np.mean(false_alarm_fracs))
 
     # Type-level
     if len(type_scores_all) > 0:
         type_m = compute_type_metrics(type_scores_all, type_targets_all, type_valid_all)
         results.update(type_m)
-
-    # False alarm area on authentic
-    if len(pred_masks_auth) > 0:
-        from src.ftt_v2.metrics import compute_false_alarm_area
-        results["false_alarm_area"] = compute_false_alarm_area(pred_masks_auth)
 
     # Validation score for checkpoint selection
     pixel_f1 = results.get("pixel_f1", 0.0)
@@ -240,6 +281,7 @@ def train_one_epoch(
 
     total_loss = 0.0
     n_steps = 0
+    n_skipped = 0
 
     # Assertion: no non-LoRA backbone param has requires_grad=True
     for name, p in model.backbone.named_parameters():
@@ -265,23 +307,24 @@ def train_one_epoch(
                 output.mask_logits, mask_gt,
                 output.det_logit, is_forged,
                 output.type_logits, type_targets, type_valid,
-                det_enabled=cfg.get("det", {}).get("enabled", False),
-                type_enabled=cfg.get("type_head", {}).get("enabled", False),
+                det_enabled=model.det_enabled,
+                type_enabled=model.type_enabled,
             )
 
         loss = losses["total"]
 
-        # Check for NaN
-        if torch.isnan(loss):
-            print(f"[WARNING] NaN loss at epoch {epoch}, step {step}. Skipping.")
-            optimizer.zero_grad()
-            continue
-
-        # Backward
-        if scaler:
-            scaler.scale(loss).backward()
+        # Check for NaN or Inf — skip backward on non-finite micro-batches
+        # without skipping the optimizer accumulation boundary.
+        if torch.isfinite(loss):
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            total_loss += loss.item() * accum_steps  # Undo the /accum in the loss
+            n_steps += 1
         else:
-            loss.backward()
+            n_skipped += 1
+            print(f"[WARNING] Non-finite loss at epoch {epoch}, step {step}. Skipping backward pass.")
 
         # Optimizer step every accum_steps
         if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
@@ -298,12 +341,22 @@ def train_one_epoch(
             if scheduler:
                 scheduler.step()
 
-        total_loss += loss.item() * accum_steps  # Undo the /accum in the loss
-        n_steps += 1
+    if n_skipped > 0:
+        skip_pct = (n_skipped / max(len(train_loader), 1)) * 100
+        print(
+            f"[WARNING] Epoch {epoch+1}: {n_skipped}/{len(train_loader)} micro-batches skipped "
+            f"({skip_pct:.1f}%) due to non-finite loss."
+        )
+        if skip_pct > 5.0:
+            raise RuntimeError(
+                f"Aborting training: {skip_pct:.1f}% of batches had non-finite loss (threshold 5%). "
+                "Consider switching amp to bf16 or reducing learning rate / grad_clip."
+            )
 
     return {
         "train_loss": total_loss / max(n_steps, 1),
         "lr": optimizer.param_groups[0]["lr"],
+        "skipped": n_skipped,
     }
 
 
@@ -437,6 +490,13 @@ def main():
     print(f"Training complete. Best score: {best_score:.4f}")
     print(f"Checkpoints saved to: {output_dir}")
     print(f"{'='*60}")
+
+    # Load best checkpoint before final save so the exported model
+    # contains the best-validation weights, not the last epoch's.
+    best_pt = output_dir / "best.pt"
+    if best_pt.exists():
+        print("[INFO] Loading best.pt before final model export...")
+        load_checkpoint(str(best_pt), model, device=str(device), restore_rng=False)
 
     # Save model via ForensicModel.save() for inference
     model.save(str(output_dir / "model"))

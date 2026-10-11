@@ -48,6 +48,10 @@ def split_tokens(
         Patch tokens reshaped to a 2-D feature map.
     """
     cls = hidden[:, 0]  # (B, d)
+    assert hidden.shape[1] == n_prefix + n_h * n_w, (
+        f"seq_len={hidden.shape[1]}, expected {n_prefix + n_h * n_w}; "
+        f"check num_register_tokens"
+    )
     patch_tokens = hidden[:, n_prefix: n_prefix + n_h * n_w]  # (B, N, d)
     B, N, d = patch_tokens.shape
     assert N == n_h * n_w, (
@@ -61,6 +65,33 @@ def split_tokens(
 # ---------------------------------------------------------------------------
 # Dummy backbone for CPU unit tests
 # ---------------------------------------------------------------------------
+
+class DummyViTLayer(nn.Module):
+    """Transformer block with explicit Q, K, V projections for PEFT testing."""
+
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        nx = self.norm1(x)
+        q = self.q_proj(nx)
+        k = self.k_proj(nx)
+        v = self.v_proj(nx)
+        x = x + self.out_proj(q)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
 
 class DummyViTBackbone(nn.Module):
     """Tiny frozen random ViT-like backbone with the same output API.
@@ -85,11 +116,11 @@ class DummyViTBackbone(nn.Module):
         with torch.random.fork_rng():
             torch.manual_seed(42)
             self.proj = nn.Linear(3 * patch_size * patch_size, embed_dim)
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=embed_dim, nhead=6, dim_feedforward=embed_dim * 2,
-                batch_first=True, dropout=0.0,
-            )
-            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=min(depth, 2))
+            self.layers = nn.ModuleList([
+                DummyViTLayer(embed_dim) for _ in range(min(depth, 2))
+            ])
+            self.encoder = nn.Module()
+            self.encoder.layers = self.layers
             self.norm = nn.LayerNorm(embed_dim)
 
             # CLS and register tokens
@@ -142,10 +173,8 @@ class DummyViTBackbone(nn.Module):
 
         hidden_states = [x] if output_hidden_states else []
 
-        # Run through encoder
-        # For dummy, we treat the whole encoder as one step and record
-        # intermediate states by running layers individually
-        for layer in self.encoder.layers:
+        # Run through layers
+        for layer in self.layers:
             x = layer(x)
             if output_hidden_states:
                 hidden_states.append(x)
@@ -185,12 +214,19 @@ def load_dinov3_backbone(
         ``n_register``, ``n_prefix``, ``mean``, ``std``.
     """
     import os
+    os.environ.setdefault("USE_TF", "0")
     from transformers import AutoModel, AutoImageProcessor
 
     token = os.environ.get("HF_TOKEN", None)
 
-    model = AutoModel.from_pretrained(hf_id, token=token, trust_remote_code=True)
-    processor = AutoImageProcessor.from_pretrained(hf_id, token=token, trust_remote_code=True)
+    model = AutoModel.from_pretrained(hf_id, token=token)
+    try:
+        processor = AutoImageProcessor.from_pretrained(hf_id, token=token)
+        mean = getattr(processor, "image_mean", [0.485, 0.456, 0.406])
+        std = getattr(processor, "image_std", [0.229, 0.224, 0.225])
+    except Exception:
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
 
     # Freeze all backbone parameters
     for p in model.parameters():
@@ -206,10 +242,6 @@ def load_dinov3_backbone(
     # DINOv3 models may have register tokens. Check the config.
     n_register = getattr(cfg, "num_register_tokens", 0)
     n_prefix = 1 + n_register  # CLS + registers
-
-    # Read normalization from processor
-    mean = getattr(processor, "image_mean", [0.485, 0.456, 0.406])
-    std = getattr(processor, "image_std", [0.229, 0.224, 0.225])
 
     info = {
         "hidden_size": hidden_size,
@@ -230,7 +262,7 @@ def load_backbone(name: str, **kwargs) -> Tuple[nn.Module, dict]:
     Parameters
     ----------
     name : str
-        ``"dinov3_vits16"`` or ``"dummy"``
+        ``"dinov3_vits16"``, ``"dinov3_vitb16"``, or ``"dummy"``
 
     Returns
     -------
@@ -255,8 +287,17 @@ def load_backbone(name: str, **kwargs) -> Tuple[nn.Module, dict]:
             "std": [0.229, 0.224, 0.225],
         }
         return model, info
-    elif name == "dinov3_vits16":
-        hf_id = kwargs.get("hf_id", "facebook/dinov3-vits16-pretrain-lvd1689m")
+    elif name.startswith("dinov3"):
+        default_map = {
+            "dinov3_vits16": "facebook/dinov3-vits16-pretrain-lvd1689m",
+            "dinov3_vitb16": "facebook/dinov3-vitb16-pretrain-lvd1689m",
+            "dinov3_vitl16": "facebook/dinov3-vitl16-pretrain-lvd1689m",
+        }
+        hf_id = kwargs.get("hf_id") or default_map.get(
+            name, f"facebook/{name.replace('_', '-')}-pretrain-lvd1689m"
+        )
         return load_dinov3_backbone(hf_id)
     else:
-        raise ValueError(f"Unknown backbone: {name!r}. Use 'dinov3_vits16' or 'dummy'.")
+        raise ValueError(
+            f"Unknown backbone: {name!r}. Use 'dinov3_vits16', 'dinov3_vitb16', or 'dummy'."
+        )

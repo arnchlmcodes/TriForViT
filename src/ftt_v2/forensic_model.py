@@ -53,9 +53,15 @@ class ForensicModel(nn.Module):
         self.cfg = cfg
 
         # ---- Backbone ----
-        backbone_name = cfg.get("backbone", {}).get("name", "dummy")
+        bb_cfg = cfg.get("backbone", {})
+        if "name" not in bb_cfg or not bb_cfg["name"]:
+            raise ValueError(
+                "Missing 'backbone.name' in configuration. "
+                "Specify 'dinov3_vitb16', 'dinov3_vits16', or 'dummy' explicitly."
+            )
+        backbone_name = bb_cfg["name"]
         backbone_kwargs = {
-            k: v for k, v in cfg.get("backbone", {}).items() if k != "name"
+            k: v for k, v in bb_cfg.items() if k != "name"
         }
         self.backbone, self.backbone_info = load_backbone(backbone_name, **backbone_kwargs)
         self.d = self.backbone_info["hidden_size"]
@@ -102,29 +108,33 @@ class ForensicModel(nn.Module):
             in_channels=decoder_in,
             embed_dim=self.d,
             image_size=self.image_size,
-            norm_type=decoder_cfg.get("norm", "bn"),
+            norm_type=decoder_cfg.get("norm", "gn"),
         )
 
         # ---- Detection head ----
         det_cfg = cfg.get("det", {})
-        self.det_enabled = det_cfg.get("enabled", False)
+        self.det_enabled = det_cfg.get("enabled", True)
         self.det_head: Optional[DetectionHead] = None
         if self.det_enabled:
             self.det_head = DetectionHead(
                 embed_dim=self.d,
                 use_mask_stats=det_cfg.get("use_mask_stats", True),
                 cm_scalars=self.cm_enabled,
+                zero_global_features=det_cfg.get("zero_global_features", False),
             )
 
         # ---- Type head ----
         type_cfg = cfg.get("type_head", {})
-        self.type_enabled = type_cfg.get("enabled", False)
+        self.type_enabled = type_cfg.get("enabled", True)
         self.type_head: Optional[TypeHead] = None
         if self.type_enabled:
             self.type_head = TypeHead(
                 embed_dim=self.d,
                 num_types=len(TYPES),
                 cm_scalars=self.cm_enabled,
+                use_mask_pooling=type_cfg.get("use_mask_pooling", False),
+                mask_pooling_mode=type_cfg.get("mask_pooling_mode", "soft"),
+                topk_pct=type_cfg.get("topk_pct", 0.05),
             )
 
         # ---- LayerNorm for patch tokens if needed ----
@@ -190,15 +200,9 @@ class ForensicModel(nn.Module):
         else:
             decoder_input = f_last
 
-        mask_logits = self.mask_decoder(decoder_input)  # (B, 1, H, W)
-
-        # ---- Low-res mask logits for detection head ----
-        # Before upsampling, the decoder produces at (n_h, n_w) resolution
-        # We pass the already-upsampled version; compute stats on low-res
-        mask_logits_32 = F.interpolate(
-            mask_logits, size=(self.n_h, self.n_w),
-            mode="bilinear", align_corners=False,
-        )
+        mask_logits, mask_logits_32 = self.mask_decoder(
+            decoder_input, return_lowres=True,
+        )  # mask_logits: (B,1,H,W), mask_logits_32: (B,1,n_h,n_w)
 
         # ---- Detection head ----
         if self.det_enabled and self.det_head is not None:
@@ -211,7 +215,9 @@ class ForensicModel(nn.Module):
 
         # ---- Type head ----
         if self.type_enabled and self.type_head is not None:
-            type_logits = self.type_head(cls_token, patch_mean, cm_map_logits)
+            type_logits = self.type_head(
+                cls_token, patch_mean, cm_map_logits, mask_logits_32, f_last,
+            )
         else:
             # Default: zeros (no type prediction)
             type_logits = torch.zeros(B, len(TYPES), device=images.device)
@@ -315,12 +321,24 @@ class ForensicModel(nn.Module):
         model = cls(cfg)
 
         weights = torch.load(path / "weights.pt", map_location=device)
-        # Load only matching keys (partial load)
-        model_state = model.state_dict()
-        for k, v in weights.items():
-            if k in model_state:
-                model_state[k] = v
-        model.load_state_dict(model_state)
+        result = model.load_state_dict(weights, strict=False)
+
+        # Only the frozen backbone weights are expected to be missing
+        # (save() deliberately excludes them). Any missing *trainable* key
+        # or any unexpected key is a real error.
+        tags = ("lora_", "mask_decoder", "det_head", "type_head",
+                "cm_branch", "patch_norm")
+        bad_missing = [
+            k for k in result.missing_keys
+            if any(t in k for t in tags)
+        ]
+        if result.unexpected_keys or bad_missing:
+            raise RuntimeError(
+                f"Checkpoint mismatch. "
+                f"unexpected={result.unexpected_keys[:5]} "
+                f"missing_trainable={bad_missing[:5]}"
+            )
+
         model.to(device)
 
         return model

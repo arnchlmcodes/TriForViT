@@ -181,3 +181,11 @@ class ValTransform:
         mask_tensor = torch.from_numpy(mask).unsqueeze(0).float()
 
         return img_tensor, mask_tensor
+
+
+def get_train_transforms(image_size: int = 512, mean: Optional[List[float]] = None, std: Optional[List[float]] = None):
+    return TrainTransform(image_size=image_size, mean=mean, std=std)
+
+
+def get_eval_transforms(image_size: int = 512, mean: Optional[List[float]] = None, std: Optional[List[float]] = None):
+    return ValTransform(image_size=image_size, mean=mean, std=std)

@@ -7,6 +7,9 @@ in the DINOv3 backbone using the ``peft`` library.
 
 from __future__ import annotations
 
+import os
+os.environ.setdefault("USE_TF", "0")
+
 from typing import List, Optional
 
 import torch
@@ -125,13 +128,15 @@ def _verify_lora(
         f"Found trainable non-LoRA params: {non_lora_trainable[:5]}"
     )
 
-    # (3) Trainable params > 0 and < 5% of total
+    # (3) Trainable params > 0 and < 10% of total
+    # Note: ViT-S (d=384) with r=64 on q/k/v across 12 layers gives ~7.6%,
+    # while ViT-B (d=768) gives ~4%. The 10% bound covers both.
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     assert trainable_params > 0, "No trainable parameters after LoRA"
     ratio = trainable_params / total_params
-    assert ratio < 0.05, (
-        f"Trainable params = {ratio:.2%} of total, expected < 5%"
+    assert ratio < 0.10, (
+        f"Trainable params = {ratio:.2%} of total, expected < 10%"
     )
 
 

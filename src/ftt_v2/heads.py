@@ -68,26 +68,34 @@ class MaskDecoder(nn.Module):
         self.conv3 = nn.Conv2d(mid2, 1, 1)
         self.image_size = image_size
 
-    def forward(self, f_last: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, f_last: torch.Tensor, return_lowres: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
         f_last : (B, in_channels, n_h, n_w)
             Patch-level feature map (e.g., 32×32 for 512 input with patch 16).
+        return_lowres : bool
+            If True, also return the pre-upsample low-res logits.
 
         Returns
         -------
         mask_logits : (B, 1, image_size, image_size)
+            When ``return_lowres=False`` (default).
+        (mask_logits, low_res_logits) : tuple
+            When ``return_lowres=True``.  ``low_res_logits`` is
+            ``(B, 1, n_h, n_w)`` — the native decoder resolution.
         """
         x = F.relu(self.norm1(self.conv1(f_last)))
         x = F.relu(self.norm2(self.conv2(x)))
-        x = self.conv3(x)  # (B, 1, n_h, n_w)
+        low = self.conv3(x)  # (B, 1, n_h, n_w)
         # Upsample to full image resolution
         mask_logits = F.interpolate(
-            x, size=(self.image_size, self.image_size),
+            low, size=(self.image_size, self.image_size),
             mode="bilinear", align_corners=False,
         )
-        return mask_logits
+        return (mask_logits, low) if return_lowres else mask_logits
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +116,7 @@ class DetectionHead(nn.Module):
         embed_dim: int,
         use_mask_stats: bool = True,
         cm_scalars: bool = False,
+        zero_global_features: bool = False,
     ):
         super().__init__()
         in_dim = 2 * embed_dim  # cls + mean_patches
@@ -118,6 +127,7 @@ class DetectionHead(nn.Module):
 
         self.use_mask_stats = use_mask_stats
         self.cm_scalars = cm_scalars
+        self.zero_global_features = zero_global_features
 
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, 256),
@@ -147,7 +157,10 @@ class DetectionHead(nn.Module):
         -------
         det_logit : (B,)
         """
-        features = [cls_token, patch_mean]
+        if self.zero_global_features:
+            features = [torch.zeros_like(cls_token), torch.zeros_like(patch_mean)]
+        else:
+            features = [cls_token, patch_mean]
 
         if self.use_mask_stats and mask_logits_32 is not None:
             ml = mask_logits_32.detach()
@@ -187,13 +200,19 @@ class TypeHead(nn.Module):
         embed_dim: int,
         num_types: int = 3,
         cm_scalars: bool = False,
+        use_mask_pooling: bool = False,
+        mask_pooling_mode: str = "soft",
+        topk_pct: float = 0.05,
     ):
         super().__init__()
-        in_dim = 2 * embed_dim  # cls + mean_patches
+        in_dim = 2 * embed_dim  # cls + mean_patches (or cls + mask_pooled_patches)
         if cm_scalars:
             in_dim += 2  # cm s_max, cm s_topk
 
         self.cm_scalars = cm_scalars
+        self.use_mask_pooling = use_mask_pooling
+        self.mask_pooling_mode = mask_pooling_mode
+        self.topk_pct = topk_pct
 
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, 256),
@@ -207,6 +226,8 @@ class TypeHead(nn.Module):
         cls_token: torch.Tensor,
         patch_mean: torch.Tensor,
         cm_map_logits: torch.Tensor | None = None,
+        mask_logits_32: torch.Tensor | None = None,
+        patch_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Parameters
@@ -214,12 +235,41 @@ class TypeHead(nn.Module):
         cls_token : (B, d)
         patch_mean : (B, d)
         cm_map_logits : (B, 1, n_h, n_w) or None
+        mask_logits_32 : (B, 1, n_h, n_w) or None
+            Used for mask-weighted pooling when use_mask_pooling=True.
+        patch_features : (B, d, n_h, n_w) or None
+            Patch-level 2D feature map.
 
         Returns
         -------
         type_logits : (B, 3)
         """
-        features = [cls_token, patch_mean]
+        if self.use_mask_pooling and mask_logits_32 is not None and patch_features is not None:
+            w = torch.sigmoid(mask_logits_32.detach())  # (B, 1, n_h, n_w)
+            w_sum = w.sum(dim=(2, 3), keepdim=True)     # (B, 1, 1, 1)
+
+            if self.mask_pooling_mode == "topk":
+                # Top-k pooling over highest-scoring patches (default top 5%)
+                B, C, H, W = patch_features.shape
+                k = max(1, int(H * W * self.topk_pct))
+                patches_flat = patch_features.flatten(2).permute(0, 2, 1)  # (B, N, C)
+                w_flat = w.flatten(2).squeeze(1)  # (B, N)
+                topk_idx = w_flat.topk(k, dim=1).indices  # (B, k)
+                topk_patches = torch.gather(patches_flat, 1, topk_idx.unsqueeze(-1).expand(-1, -1, C))
+                topk_mean = topk_patches.mean(dim=1)  # (B, C)
+                # Fall back to uniform patch_mean on authentic / empty masks
+                use_mask = (w_sum.flatten(1) > 1e-3).float()  # (B, 1)
+                pooled_feat = torch.where(use_mask > 0, topk_mean, patch_mean)
+            else:
+                # Soft sigmoid weighting with empty-mask uniform fallback
+                uniform = torch.full_like(w, 1.0 / max(w.shape[2] * w.shape[3], 1))
+                use_mask = (w_sum > 1e-3).float()
+                w_norm = torch.where(use_mask > 0, w / w_sum.clamp(min=1e-5), uniform)
+                pooled_feat = (patch_features * w_norm).sum(dim=(2, 3))  # (B, d)
+
+            features = [cls_token, pooled_feat]
+        else:
+            features = [cls_token, patch_mean]
 
         if self.cm_scalars and cm_map_logits is not None:
             cm = cm_map_logits.detach()

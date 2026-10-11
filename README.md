@@ -1,4 +1,4 @@
-# A Robust Patch-Based Hierarchical Framework for Image Forgery Detection and Classification
+# Robust Multi-Task Framework for Image Forgery Detection, Localization, and Classification (FTT v2)
 
 > **Team 39** — Final Year IAPR Research Project  
 > Dheeraj KB · Nehan GRM · Harish Veylan P · Balaji AR  
@@ -6,129 +6,164 @@
 
 ## Overview
 
-This project proposes a **Three-Stream Tokenization Vision Transformer (ViT)** that jointly fuses spatial, frequency (FFT), and noise-residual (SRM-style) patch representations via cross-attention for robust image forgery detection and classification.
+**FTT v2 (Forensic Transformer v2)** is an end-to-end multi-task image forensics framework. It leverages a self-supervised **DINOv3 ViT-S/16** foundation vision transformer adapted via **LoRA** (Low-Rank Adaptation) and incorporates a specialized **Self-Correlation Copy-Move Branch** alongside convolutional localization and classification heads.
 
-### Hierarchical Strategy
-1. **Stage 1** — Binary Detection: Authentic vs. Tampered
-2. **Stage 2** — Forgery-Type Classification: Copy-Move / Splicing / Inpainting
+### Multi-Task Capabilities
+1. **Pixel-Level Localization (`mask_logits`)**: High-resolution $(512 \times 512)$ segmentation mask locating forged pixels with boundary-aware edge loss.
+2. **Image-Level Tamper Detection (`det_logit`)**: Binary decision logit determining Authentic vs. Forged.
+3. **Forgery Type Classification (`type_logits`)**: Multi-label classification across `copy_move`, `splicing`, and `inpainting`.
+
+---
+
+## Architecture
+
+```
+                             Input Image (B, 3, 512, 512)
+                                          │
+                                          ▼
+                         Frozen DINOv3 ViT-S/16 Backbone
+                       (LoRA on Q, K, V Attention Projections)
+                                ├── Layer 4 Hidden States ──┐
+                                │                           ▼
+                                │                 Copy-Move Correlation Branch
+                                │                 • Patch Affinity Matrix (Chebyshev Masked)
+                                │                 • Mutual Match Normalization
+                                │                 • Top-8 Descriptors + Conv Head
+                                │                           │
+                                ▼                           ▼
+                      Last Hidden State (Layer 12)     cm_feat (B, 32, 32, 32)
+                                │                           │
+             ┌──────────────────┼───────────────────────────┘
+             │                  ▼
+             │         Concatenate [F_last, cm_feat]
+             │                  │
+             │                  ▼
+             │            Mask Decoder
+             │         (Conv3x3 + Norm + ReLU -> Bilinear 16x)
+             │                  │
+             │                  ▼
+             │         mask_logits (B, 1, 512, 512)
+             │
+             ├──> Detection Head (MLP on CLS + Patch Mean + Detached Mask/CM Stats) ──> det_logit (B,)
+             │
+             └──> Type Head (MLP on CLS + Patch Mean + Detached CM Stats) ──────────> type_logits (B, 3)
+```
+
+---
 
 ## Project Structure
 
 ```
 .
-├── docs/                        # PPT, Report, Literature
-├── notebooks/                   # Jupyter notebooks for EDA / experiments
+├── configs/                         # Model and training YAML configurations
+│   ├── ftt_v2_main.yaml             # Production run config (DINOv3 ViT-S/16 + all heads)
+│   ├── ftt_v2_pilot_stageA.yaml     # Stage A: Decoder-only baseline
+│   ├── ftt_v2_pilot_stageB.yaml     # Stage B: LoRA + Decoder
+│   ├── ftt_v2_pilot_stageC.yaml     # Stage C: Multi-task (LoRA + Det + Type + Decoder)
+│   └── ftt_v2_pilot_stageD.yaml     # Stage D: Full multi-task + Copy-Move branch
+├── docs/                            # Research reports, review slides, design decisions
+│   ├── DECISIONS.md                 # Architecture and design rationale
+│   ├── OPEN_QUESTIONS.md            # Tracked questions and future research directions
+│   ├── PROGRESS.md                  # Implementation phase audit and progress log
+│   ├── REPO_AUDIT.md                # System audit and hardware specifications
+│   ├── RESULTS.md                   # Evaluation results and metric benchmarks
+│   ├── Team_39_Phase-2_Review-1_PPT.pdf
+│   └── Team_39_Phase-2_Review-1_Report.pdf
+├── scripts/                         # Manifest generation, inspection, and CLI tools
+│   ├── build_manifest_casia.py      # Build dataset manifest for CASIA
+│   ├── build_manifest_columbia.py   # Build dataset manifest for Columbia
+│   ├── build_manifest_coverage.py   # Build dataset manifest for COVERAGE
+│   ├── build_manifest_defacto.py    # Build dataset manifest for Defacto
+│   ├── check_leakage.py             # Test for train/val data overlap via perceptual hash
+│   ├── evaluate.py                  # CLI evaluation entrypoint
+│   ├── infer.py                     # Single-image inference entrypoint
+│   ├── make_inpaint_testset.py      # Synthesize test cases for inpainting
+│   ├── shortcut_probe.py            # Diagnostic tool for dataset shortcuts
+│   └── visualize_batch.py           # Batch visual inspection tool
 ├── src/
-│   ├── extractors.py            # FFT, SRM noise-residual, patch extraction
-│   ├── model.py                 # Three-Stream ViT architecture
-│   ├── data_loader.py           # Dataset & DataLoader
-│   ├── train.py                 # Training loop
-│   ├── evaluate.py              # Evaluation metrics & Grad-CAM
-│   └── download_datasets.py     # Dataset URLs & references
-├── results/
-│   ├── figures/                 # Plots, attention maps
-│   └── checkpoints/             # Model weights
-├── requirements.txt
-└── README.md
+│   └── ftt_v2/                      # Core FTT v2 architecture package
+│       ├── backbone.py              # DINOv3 ViT and CPU dummy backbone loader
+│       ├── copy_move.py             # Explicit self-correlation copy-move branch
+│       ├── forensic_model.py        # Unified ForensicModel nn.Module
+│       ├── heads.py                 # Mask decoder, detection head, type head
+│       ├── lora.py                  # PEFT LoRA adapter injection
+│       ├── losses.py                # Boundary-aware edge loss + multi-task objective
+│       ├── metrics.py               # Pixel F1, IoU, image AUC, mAP evaluation metrics
+│       ├── outputs.py               # ModelOutput container dataclass
+│       ├── train.py                 # Multi-task training engine
+│       ├── evaluate.py              # Evaluation script
+│       ├── infer.py                 # Inference and decision thresholding logic
+│       ├── data/                    # Dataset, transforms, manifest parser, split engine
+│       └── utils/                   # Checkpointing, seed utilities
+├── tests/                           # Unit and integration test suite
+├── requirements.txt                 # Project dependencies
+└── FTT_V2_IMPLEMENTATION_PLAN.md    # Full specification and architecture design document
 ```
+
+---
 
 ## Setup
 
 ```bash
-# 1. Clone the repo
-git clone <your-repo-url>
-cd "Final Year IAPR Project"
-
-# 2. Create a virtual environment
+# 1. Create and activate a virtual environment
 python -m venv venv
 venv\Scripts\activate        # Windows
 # source venv/bin/activate   # Linux/macOS
 
-# 3. Install dependencies
+# 2. Install dependencies
 pip install -r requirements.txt
 ```
 
-## Datasets (Online)
-
-Datasets are **not stored locally** — they are accessed via online links during training.
-
-Run the dataset reference script to see all sources:
-
-```bash
-python src/download_datasets.py
-```
-
-| Dataset    | Year | Images | Forgery Types                  | Source                 |
-|------------|------|--------|--------------------------------|------------------------|
-| CASIA v2.0 | 2013 | ~12K   | Copy-Move, Splicing            | Kaggle                 |
-| IMD2020    | 2020 | ~2010  | Inpainting, Removal, Mixed     | UTIA (manual)          |
-| Columbia   | 2004 | 363    | Splicing                       | Columbia DVMM (form)   |
-| COVERAGE   | 2018 | 200    | Copy-Move                      | GitHub / OneDrive      |
-
-## Training
-
-```bash
-python src/train.py --data_dir <path-or-url> --epochs 50 --batch_size 32
-```
-
-## Evaluation
-
-```bash
-python src/evaluate.py --data_dir <path-or-url> --checkpoint results/checkpoints/model_final.pth
-```
-
-## References
-
-- Fridrich et al. (2003) — Copy-move forgery detection
-- Bayar & Stamm (2016) — Deep learning for manipulation detection
-- Dosovitskiy et al. (2021) — Vision Transformer (ViT)
-- Fridrich & Kodovsky (2012) — SRM filters for steganalysis
-- Wu et al. (2019) — ManTra-Net
-- Selvaraju et al. (2017) — Grad-CAM
-
 ---
 
-## FTT v2: DINOv3 + LoRA Multi-Task Model
+## Running Tests
 
-In addition to the baseline `ThreeStreamViT`, this repository implements **FTT v2** per `FTT_V2_IMPLEMENTATION_PLAN.md`. FTT v2 adds pixel-level localization (segmentation mask), multi-label forgery type classification, and forgery detection on top of a frozen DINOv3 ViT-S/16 backbone adapted via LoRA.
+All unit tests run on CPU without requiring GPU or gated Hugging Face model access:
 
-### Model Features
-- **Backbone**: Frozen `facebook/dinov3-vits16-pretrain-lvd1689m` (or CPU `dummy` backbone for offline unit tests).
-- **LoRA Adaptor**: Parameter-efficient fine-tuning on Q, K, V self-attention projections (<5% of backbone params).
-- **Mask Decoder**: Conv decoder with edge-band dilation-erosion loss (`L_edge`).
-- **Multi-Task Heads**: Image-level detection (`det_logit`) and multi-label type classification (`type_logits` across copy-move, splicing, inpainting).
-- **Copy-Move Branch**: Explicit patch self-correlation with Chebyshev distance masking and mutual-match normalization.
-
-### Running Tests
-All tests run on CPU without requiring GPU or gated HF models:
 ```bash
 python -m pytest tests -v
 ```
 
-### Training
+---
+
+## Training
+
+### Progressive Ablation Runs (Pilot Stages)
 ```bash
-# Stage A (Mask decoder only baseline)
+# Stage A: Mask decoder only baseline (frozen backbone)
 python -m src.ftt_v2.train --config configs/ftt_v2_pilot_stageA.yaml
 
-# Stage B (LoRA + Mask decoder)
+# Stage B: LoRA + Mask decoder
 python -m src.ftt_v2.train --config configs/ftt_v2_pilot_stageB.yaml
 
-# Stage C (LoRA + Detection head + Type head)
+# Stage C: Multi-task (LoRA + Detection head + Type head + Mask decoder)
 python -m src.ftt_v2.train --config configs/ftt_v2_pilot_stageC.yaml
 
-# Stage D (LoRA + All heads + Copy-Move branch)
+# Stage D: Full model (LoRA + All heads + Copy-Move branch)
 python -m src.ftt_v2.train --config configs/ftt_v2_pilot_stageD.yaml
+```
 
-# Main full run
+### Full Production Run
+```bash
 python -m src.ftt_v2.train --config configs/ftt_v2_main.yaml
 ```
 
-### Evaluation & Inference
-```bash
-# Evaluate on any manifest
-python scripts/evaluate.py --model-dir outputs/ftt_v2/model --manifest data/manifests/val.csv --output-dir outputs/ftt_v2/eval
+---
 
-# Predict on an image
-python scripts/infer.py --model-dir outputs/ftt_v2/model --image path/to/sample.jpg --output outputs/ftt_v2/preds
+## Evaluation & Inference
+
+### Benchmark on a Manifest
+```bash
+python scripts/evaluate.py \
+  --model-dir outputs/ftt_v2/model \
+  --manifest data/manifests/val.csv \
+  --output-dir outputs/ftt_v2/eval
 ```
 
+### Predict on an Image
+```bash
+python scripts/infer.py \
+  --model-dir outputs/ftt_v2/model \
+  --image path/to/sample.jpg \
+  --output outputs/ftt_v2/preds
+```

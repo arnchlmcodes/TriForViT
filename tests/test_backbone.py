@@ -138,3 +138,31 @@ class TestLoadBackbone:
     def test_custom_embed_dim(self):
         model, info = load_backbone("dummy", embed_dim=768, depth=12)
         assert info["hidden_size"] == 768
+
+    def test_missing_backbone_name_raises(self):
+        from src.ftt_v2.forensic_model import ForensicModel
+        cfg = {"model": {"name": "ftt_v2", "image_size": 128}, "backbone": {}}
+        with pytest.raises(ValueError, match="Missing 'backbone.name' in configuration"):
+            ForensicModel(cfg)
+
+    @pytest.mark.skipif(not os.environ.get("HF_TOKEN"), reason="Requires HF_TOKEN environment variable")
+    def test_real_dinov3_vitb16(self):
+        """Integration test for real DINOv3 ViT-B backbone when HF_TOKEN is provided."""
+        from src.ftt_v2.lora import apply_lora, find_qkv_target_modules
+
+        model, info = load_backbone("dinov3_vitb16")
+        assert info["hidden_size"] == 768
+        assert info["num_hidden_layers"] == 12
+        assert info["n_prefix"] >= 1
+
+        targets = find_qkv_target_modules(model)
+        assert len(targets) > 0
+
+        lora_model = apply_lora(model, r=64, alpha=128, target_modules=targets)
+        backbone_total = sum(p.numel() for p in lora_model.parameters())
+        trainable = sum(p.numel() for p in lora_model.parameters() if p.requires_grad)
+        ratio = trainable / backbone_total
+        # ViT-B should have ~4% trainable parameters (well under 10%)
+        assert ratio < 0.10
+        assert ratio > 0.01
+

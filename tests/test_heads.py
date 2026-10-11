@@ -165,3 +165,60 @@ class TestForensicModelShapes:
         assert out.type_logits.shape == (2, 3)
         assert out.cm_map_logits is not None
         assert out.cm_map_logits.shape == (2, 1, 32, 32)
+
+    def test_zero_global_features_ablation(self):
+        """Detection head with zero_global_features=True ignores cls and patch_mean."""
+        from src.ftt_v2.heads import DetectionHead
+        head = DetectionHead(embed_dim=384, use_mask_stats=True, zero_global_features=True)
+        head.eval()
+
+        cls1 = torch.randn(2, 384)
+        cls2 = torch.randn(2, 384)
+        p1 = torch.randn(2, 384)
+        p2 = torch.randn(2, 384)
+        mask_32 = torch.randn(2, 1, 32, 32)
+
+        out1 = head(cls1, p1, mask_logits_32=mask_32)
+        out2 = head(cls2, p2, mask_logits_32=mask_32)
+        assert torch.allclose(out1, out2, atol=1e-6)
+
+    def test_type_head_mask_pooling(self):
+        """Type head with use_mask_pooling=True pools tampered region features."""
+        from src.ftt_v2.heads import TypeHead
+        head = TypeHead(embed_dim=384, use_mask_pooling=True)
+        cls = torch.randn(2, 384)
+        p_mean = torch.randn(2, 384)
+        mask_32 = torch.randn(2, 1, 32, 32)
+        f_last = torch.randn(2, 384, 32, 32)
+
+        out = head(cls, p_mean, mask_logits_32=mask_32, patch_features=f_last)
+        assert out.shape == (2, 3)
+
+    def test_type_head_mask_pooling_empty_mask_fallback(self):
+        """Type head with near-zero predicted mask falls back to uniform weights without NaNs."""
+        from src.ftt_v2.heads import TypeHead
+        head = TypeHead(embed_dim=384, use_mask_pooling=True)
+        head.eval()
+        cls = torch.randn(2, 384)
+        p_mean = torch.randn(2, 384)
+        # All logits -50.0 -> sigmoid values ~ 0.0, sum is tiny
+        empty_mask_32 = torch.full((2, 1, 32, 32), -50.0)
+        f_last = torch.randn(2, 384, 32, 32)
+
+        out = head(cls, p_mean, mask_logits_32=empty_mask_32, patch_features=f_last)
+        assert out.shape == (2, 3)
+        assert torch.isfinite(out).all()
+
+    def test_type_head_topk_mask_pooling(self):
+        """Type head with topk mask pooling mode (top 5% patches)."""
+        from src.ftt_v2.heads import TypeHead
+        head = TypeHead(embed_dim=384, use_mask_pooling=True, mask_pooling_mode="topk", topk_pct=0.05)
+        head.eval()
+        cls = torch.randn(2, 384)
+        p_mean = torch.randn(2, 384)
+        mask_32 = torch.randn(2, 1, 32, 32)
+        f_last = torch.randn(2, 384, 32, 32)
+
+        out = head(cls, p_mean, mask_logits_32=mask_32, patch_features=f_last)
+        assert out.shape == (2, 3)
+        assert torch.isfinite(out).all()

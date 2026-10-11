@@ -11,6 +11,8 @@ usually mark only the pasted one. Let it learn only through downstream losses.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,18 +48,15 @@ class CopyMoveBranch(nn.Module):
         # Projection to lower dim + L2 normalize
         self.proj = nn.Linear(embed_dim, proj_dim)
 
-        # Learnable temperature
-        self.tau = nn.Parameter(torch.tensor(tau_init))
+        # Learnable log-temperature: learn log(tau) so tau stays positive
+        # and is not pulled toward zero by weight decay.
+        self.log_tau = nn.Parameter(torch.tensor(math.log(tau_init)))
 
         # Near-neighbor mask: precomputed (N, N) boolean
         # near[i,j] = True if Chebyshev distance <= min_dist
-        near = torch.zeros(N, N, dtype=torch.bool)
-        for i in range(N):
-            ri, ci = divmod(i, grid_w)
-            for j in range(N):
-                rj, cj = divmod(j, grid_w)
-                if max(abs(ri - rj), abs(ci - cj)) <= min_dist:
-                    near[i, j] = True
+        ys, xs = torch.meshgrid(torch.arange(grid_h), torch.arange(grid_w), indexing="ij")
+        coords = torch.stack([ys.flatten(), xs.flatten()], dim=1)  # (N, 2)
+        near = (coords[:, None] - coords[None]).abs().amax(dim=-1) <= min_dist
         self.register_buffer("near_mask", near)
 
         # Small conv head on top-k descriptors
@@ -98,8 +97,9 @@ class CopyMoveBranch(nn.Module):
         Fn = self.proj(patch_tokens)  # (B, N, proj_dim)
         Fn = F.normalize(Fn, p=2, dim=-1)
 
-        # 2. Affinity: A = Fn @ Fn^T / tau
-        A = torch.bmm(Fn, Fn.transpose(1, 2)) / self.tau  # (B, N, N)
+        # 2. Affinity: A = Fn @ Fn^T / tau (tau = exp(log_tau), clamped > 0)
+        tau = self.log_tau.exp().clamp(min=0.01)
+        A = torch.bmm(Fn, Fn.transpose(1, 2)) / tau  # (B, N, N)
 
         # 3. Mask out self and nearby patches (use finite value, never -inf)
         A = A.masked_fill(self.near_mask.unsqueeze(0), -1e4)

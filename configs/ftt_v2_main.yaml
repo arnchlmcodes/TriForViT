@@ -10,8 +10,8 @@ model:
     - inpainting
 
 backbone:
-  name: dinov3_vits16
-  hf_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  name: dinov3_vitb16
+  hf_id: facebook/dinov3-vitb16-pretrain-lvd1689m
   frozen: true
 
 lora:
@@ -22,11 +22,12 @@ lora:
   targets: qkv_all_layers
 
 decoder:
-  norm: bn  # use gn if micro_batch < 8
+  norm: gn
 
 det:
   enabled: true
   use_mask_stats: true
+  zero_global_features: false
 
 type_head:
   enabled: true
@@ -52,7 +53,7 @@ train:
   lr: 3.0e-4
   weight_decay: 0.01
   grad_clip: 1.0
-  micro_batch: 8
+  micro_batch: 4  # 4 for ViT-B/16 at 512x512 on T4 GPU
   effective_batch: 240
   amp: fp16
   eval_every: 4
