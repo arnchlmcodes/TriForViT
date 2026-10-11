@@ -24,6 +24,12 @@ from sklearn.metrics import (
 from . import TYPES
 
 
+def _to_numpy(x) -> np.ndarray:
+    if hasattr(x, "detach"):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
 # ---------------------------------------------------------------------------
 # Image-level metrics
 # ---------------------------------------------------------------------------
@@ -33,6 +39,8 @@ def compute_image_metrics(
     det_labels: np.ndarray,
     tau_det: float = 0.5,
 ) -> Dict[str, float]:
+    det_scores = _to_numpy(det_scores)
+    det_labels = _to_numpy(det_labels)
     """Compute image-level detection metrics.
 
     Parameters
@@ -93,19 +101,11 @@ def compute_type_metrics(
     type_valid: np.ndarray,
     tau_type: Optional[List[float]] = None,
 ) -> Dict[str, float]:
-    """Compute per-type AP and F1.
+    """Compute per-type AP and F1."""
+    type_scores = _to_numpy(type_scores)
+    type_targets = _to_numpy(type_targets)
+    type_valid = _to_numpy(type_valid)
 
-    Parameters
-    ----------
-    type_scores : (N, 3)
-        Sigmoid probabilities.
-    type_targets : (N, 3)
-        Ground-truth binary targets.
-    type_valid : (N, 3)
-        Valid mask (1 = count this entry).
-    tau_type : list of 3 floats or None
-        Per-class thresholds. Default [0.5, 0.5, 0.5].
-    """
     if tau_type is None:
         tau_type = [0.5] * len(TYPES)
 
@@ -140,17 +140,14 @@ def compute_pixel_metrics(
     gt_masks: np.ndarray,
     threshold: float = 0.5,
 ) -> Dict[str, float]:
-    """Compute pixel-level F1 and IoU on forged images only.
+    """Compute pixel-level F1 and IoU on forged images only."""
+    pred_masks = _to_numpy(pred_masks)
+    gt_masks = _to_numpy(gt_masks)
+    if pred_masks.ndim == 4 and pred_masks.shape[1] == 1:
+        pred_masks = pred_masks.squeeze(1)
+    if gt_masks.ndim == 4 and gt_masks.shape[1] == 1:
+        gt_masks = gt_masks.squeeze(1)
 
-    Parameters
-    ----------
-    pred_masks : (N, H, W)
-        Predicted probability masks (after sigmoid).
-    gt_masks : (N, H, W)
-        Ground-truth binary masks {0, 1}.
-    threshold : float
-        Binarization threshold.
-    """
     preds_binary = (pred_masks >= threshold).astype(np.float32)
 
     # Per-image then average

@@ -66,7 +66,7 @@ def load_checkpoint(
     info : dict
         Contains ``epoch``, ``best_score``, ``config``.
     """
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
 
     model.load_state_dict(ckpt["model_state_dict"])
 

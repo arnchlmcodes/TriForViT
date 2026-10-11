@@ -1,0 +1,63 @@
+# FTT v2 — Stage B: LoRA (r=64) + mask decoder
+# Purpose: Does LoRA improve over frozen-only (Stage A)?
+
+model:
+  name: ftt_v2
+  image_size: 512
+  types:
+    - copy_move
+    - splicing
+    - inpainting
+
+backbone:
+  name: dummy              # Use 'dinov3_vits16' for real training
+  # hf_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  frozen: true
+
+lora:
+  enabled: true             # Stage B: LoRA ON
+  r: 64
+  alpha: 128
+  dropout: 0.0
+
+decoder:
+  norm: gn
+
+det:
+  enabled: false            # Still off in Stage B
+  use_mask_stats: true
+
+type_head:
+  enabled: false
+  pos_weight: null
+
+cm:
+  enabled: false
+  tap_layer: 4
+  proj_dim: 128
+  min_dist: 3
+  topk: 8
+  tau_init: 0.1
+
+loss:
+  lambda_edge: 20
+  edge_band_px: 7
+  lambda_det: 1.0
+  lambda_type: 1.0
+
+train:
+  epochs: 20
+  warmup_epochs: 5
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  micro_batch: 8
+  effective_batch: 64
+  amp: fp16
+  eval_every: 4
+  seed: 42
+
+data:
+  manifest_dir: data/manifests
+  balanced_sampler: true
+  num_workers: 4

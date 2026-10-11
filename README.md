@@ -85,3 +85,50 @@ python src/evaluate.py --data_dir <path-or-url> --checkpoint results/checkpoints
 - Fridrich & Kodovsky (2012) — SRM filters for steganalysis
 - Wu et al. (2019) — ManTra-Net
 - Selvaraju et al. (2017) — Grad-CAM
+
+---
+
+## FTT v2: DINOv3 + LoRA Multi-Task Model
+
+In addition to the baseline `ThreeStreamViT`, this repository implements **FTT v2** per `FTT_V2_IMPLEMENTATION_PLAN.md`. FTT v2 adds pixel-level localization (segmentation mask), multi-label forgery type classification, and forgery detection on top of a frozen DINOv3 ViT-S/16 backbone adapted via LoRA.
+
+### Model Features
+- **Backbone**: Frozen `facebook/dinov3-vits16-pretrain-lvd1689m` (or CPU `dummy` backbone for offline unit tests).
+- **LoRA Adaptor**: Parameter-efficient fine-tuning on Q, K, V self-attention projections (<5% of backbone params).
+- **Mask Decoder**: Conv decoder with edge-band dilation-erosion loss (`L_edge`).
+- **Multi-Task Heads**: Image-level detection (`det_logit`) and multi-label type classification (`type_logits` across copy-move, splicing, inpainting).
+- **Copy-Move Branch**: Explicit patch self-correlation with Chebyshev distance masking and mutual-match normalization.
+
+### Running Tests
+All tests run on CPU without requiring GPU or gated HF models:
+```bash
+python -m pytest tests -v
+```
+
+### Training
+```bash
+# Stage A (Mask decoder only baseline)
+python -m src.ftt_v2.train --config configs/ftt_v2_pilot_stageA.yaml
+
+# Stage B (LoRA + Mask decoder)
+python -m src.ftt_v2.train --config configs/ftt_v2_pilot_stageB.yaml
+
+# Stage C (LoRA + Detection head + Type head)
+python -m src.ftt_v2.train --config configs/ftt_v2_pilot_stageC.yaml
+
+# Stage D (LoRA + All heads + Copy-Move branch)
+python -m src.ftt_v2.train --config configs/ftt_v2_pilot_stageD.yaml
+
+# Main full run
+python -m src.ftt_v2.train --config configs/ftt_v2_main.yaml
+```
+
+### Evaluation & Inference
+```bash
+# Evaluate on any manifest
+python scripts/evaluate.py --model-dir outputs/ftt_v2/model --manifest data/manifests/val.csv --output-dir outputs/ftt_v2/eval
+
+# Predict on an image
+python scripts/infer.py --model-dir outputs/ftt_v2/model --image path/to/sample.jpg --output outputs/ftt_v2/preds
+```
+

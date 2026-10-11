@@ -79,22 +79,25 @@ class DummyViTBackbone(nn.Module):
         # n_prefix = 1 (CLS) + n_register
         self.n_prefix = 1 + n_register
 
-        # Tiny linear projection (replaces real patch embedding)
-        self.proj = nn.Linear(3 * patch_size * patch_size, embed_dim)
-        # Simple transformer blocks (tiny)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=6, dim_feedforward=embed_dim * 2,
-            batch_first=True, dropout=0.0,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=min(depth, 2))
-        self.norm = nn.LayerNorm(embed_dim)
-
-        # CLS and register tokens
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
-        if n_register > 0:
-            self.register_tokens = nn.Parameter(
-                torch.randn(1, n_register, embed_dim) * 0.02
+        # Initialize dummy parameters deterministically so that
+        # re-instantiating the dummy backbone (like loading a pretrained checkpoint)
+        # produces identical weights.
+        with torch.random.fork_rng():
+            torch.manual_seed(42)
+            self.proj = nn.Linear(3 * patch_size * patch_size, embed_dim)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=embed_dim, nhead=6, dim_feedforward=embed_dim * 2,
+                batch_first=True, dropout=0.0,
             )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=min(depth, 2))
+            self.norm = nn.LayerNorm(embed_dim)
+
+            # CLS and register tokens
+            self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+            if n_register > 0:
+                self.register_tokens = nn.Parameter(
+                    torch.randn(1, n_register, embed_dim) * 0.02
+                )
 
         # Freeze everything
         for p in self.parameters():

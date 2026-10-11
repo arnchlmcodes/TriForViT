@@ -5,3 +5,11 @@ Pillow
 scikit-learn
 matplotlib
 tqdm
+transformers>=4.40.0
+peft>=0.10.0
+timm>=0.9.0
+pandas
+PyYAML
+imagehash
+opencv-python>=4.8.0
+pytest

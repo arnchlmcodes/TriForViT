@@ -33,3 +33,8 @@ results/figures/
 Thumbs.db
 .DS_Store
 desktop.ini
+
+# --- Testing / Cache ---
+.pytest_cache/
+.benchmarks/
+
