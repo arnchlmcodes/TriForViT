@@ -1,0 +1,65 @@
+# FTT v2 — Ablation B: Mask-Weighted Pooling in Type Head
+# Evaluates feeding tampered-region mask-weighted patch pooling to TypeHead
+# while keeping standard detection head with global features enabled.
+
+model:
+  name: ftt_v2
+  image_size: 512
+  types:
+    - copy_move
+    - splicing
+    - inpainting
+
+backbone:
+  name: dinov3_vitb16
+  hf_id: facebook/dinov3-vitb16-pretrain-lvd1689m
+  frozen: true
+
+lora:
+  enabled: true
+  r: 64
+  alpha: 128
+  dropout: 0.0
+  targets: qkv_all_layers
+
+decoder:
+  norm: gn
+
+det:
+  enabled: true
+  use_mask_stats: true
+  zero_global_features: false
+
+type_head:
+  enabled: true
+  pos_weight: null
+  use_mask_pooling: true
+
+cm:
+  enabled: true
+  tap_layer: 4
+  proj_dim: 128
+  min_dist: 3
+  topk: 8
+  tau_init: 0.1
+
+loss:
+  lambda_edge: 20
+  edge_band_px: 7
+  lambda_det: 1.0
+  lambda_type: 1.0
+
+train:
+  epochs: 100
+  warmup_epochs: 5
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  micro_batch: 4
+  effective_batch: 240
+  amp: fp16
+  eval_every: 4
+  seed: 42
+
+data:
+  manifest_dir: data/manifests
